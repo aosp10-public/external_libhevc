@@ -45,22 +45,47 @@
 #include <stdlib.h>
 #include <assert.h>
 #include <stdarg.h>
-#include <math.h>
 
 /* User include files */
 #include "ihevc_typedefs.h"
-
 #include "itt_video_api.h"
-#include "ihevc_macros.h"
 #include "ihevce_api.h"
+
+#include "rc_cntrl_param.h"
+#include "rc_frame_info_collector.h"
+#include "rc_look_ahead_params.h"
+
+#include "ihevc_defs.h"
+#include "ihevc_macros.h"
+#include "ihevc_debug.h"
+#include "ihevc_structs.h"
+#include "ihevc_platform_macros.h"
+#include "ihevc_deblk.h"
+#include "ihevc_itrans_recon.h"
+#include "ihevc_chroma_itrans_recon.h"
+#include "ihevc_chroma_intra_pred.h"
+#include "ihevc_intra_pred.h"
+#include "ihevc_inter_pred.h"
+#include "ihevc_mem_fns.h"
+#include "ihevc_padding.h"
+#include "ihevc_weighted_pred.h"
+#include "ihevc_sao.h"
+#include "ihevc_resi_trans.h"
+#include "ihevc_quant_iquant_ssd.h"
+
+#include "ihevce_defs.h"
+#include "ihevce_lap_enc_structs.h"
 #include "ihevce_plugin.h"
 #include "ihevce_plugin_priv.h"
-#include "ihevc_debug.h"
-
-/* library and utilities */
 #include "ihevce_hle_interface.h"
+#include "ihevce_multi_thrd_structs.h"
+#include "ihevce_me_common_defs.h"
+#include "ihevce_error_codes.h"
+#include "ihevce_error_checks.h"
+#include "ihevce_function_selector.h"
+#include "ihevce_enc_structs.h"
+#include "ihevce_global_tables.h"
 
-/* OSAL : Operating system Abstarction layer interface */
 #include "cast_types.h"
 #include "osal.h"
 #include "osal_defaults.h"
@@ -343,6 +368,8 @@ IHEVCE_PLUGIN_STATUS_T ihevce_set_def_params(ihevce_static_cfg_params_t *ps_para
     ps_params->s_src_prms.i4_input_bit_depth = 8;
     ps_params->s_src_prms.i4_topfield_first = 1;
     ps_params->s_src_prms.i4_width = 0;  //1920;
+    ps_params->s_src_prms.i4_orig_width = 0;
+    ps_params->s_src_prms.i4_orig_height = 0;
 
     /* Target layer parameters */
     ps_params->s_tgt_lyr_prms.i4_size = sizeof(ihevce_tgt_layer_params_t);
@@ -677,6 +704,20 @@ IHEVCE_PLUGIN_STATUS_T ihevce_init(ihevce_static_cfg_params_t *ps_params, void *
         /*            Back up the static params passed by caller                 */
         /* --------------------------------------------------------------------- */
         memcpy(ps_ctxt->ps_static_cfg_prms, ps_params, sizeof(ihevce_static_cfg_params_t));
+
+        ps_ctxt->ps_static_cfg_prms->s_src_prms.i4_orig_width =
+            ps_ctxt->ps_static_cfg_prms->s_src_prms.i4_width;
+        if(HEVCE_MIN_WIDTH > ps_ctxt->ps_static_cfg_prms->s_src_prms.i4_width)
+        {
+            ps_ctxt->ps_static_cfg_prms->s_src_prms.i4_width = HEVCE_MIN_WIDTH;
+        }
+
+        ps_ctxt->ps_static_cfg_prms->s_src_prms.i4_orig_height =
+            ps_ctxt->ps_static_cfg_prms->s_src_prms.i4_height;
+        if(HEVCE_MIN_HEIGHT > ps_ctxt->ps_static_cfg_prms->s_src_prms.i4_height)
+        {
+            ps_ctxt->ps_static_cfg_prms->s_src_prms.i4_height = HEVCE_MIN_HEIGHT;
+        }
 
         /* setting tgt width and height same as src width and height */
         ps_ctxt->ps_static_cfg_prms->s_tgt_lyr_prms.as_tgt_params[0].i4_width =
@@ -1634,12 +1675,18 @@ IHEVCE_PLUGIN_STATUS_T ihevce_close(void *pv_ihevce_hdl)
 *****************************************************************************
 */
 IV_API_CALL_STATUS_T ihevce_copy_inp_8bit(
-    iv_input_data_ctrl_buffs_t *ps_curr_inp, ihevce_inp_buf_t *ps_inp, WORD32 chroma_format)
+    iv_input_data_ctrl_buffs_t *ps_curr_inp,
+    ihevce_inp_buf_t *ps_inp,
+    WORD32 chroma_format,
+    WORD32 i4_orig_wd,
+    WORD32 i4_orig_ht)
 {
     UWORD8 *pu1_src, *pu1_dst;
     WORD32 src_strd, dst_strd;
-    WORD32 frm_height = ps_curr_inp->s_input_buf.i4_y_ht;
-    WORD32 frm_width = ps_curr_inp->s_input_buf.i4_y_wd;
+    WORD32 frm_height = i4_orig_ht;
+    WORD32 frm_width = i4_orig_wd;
+    WORD32 buf_height = ps_curr_inp->s_input_buf.i4_y_ht;
+    WORD32 buf_width = ps_curr_inp->s_input_buf.i4_y_wd;
     WORD32 rows, cols;
 
     pu1_src = (UWORD8 *)ps_inp->apv_inp_planes[0];
@@ -1656,8 +1703,18 @@ IV_API_CALL_STATUS_T ihevce_copy_inp_8bit(
     for(rows = 0; rows < frm_height; rows++)
     {
         memcpy(pu1_dst, pu1_src, frm_width);
+        if(buf_width > frm_width)
+        {
+            memset(pu1_dst + frm_width, 0x0, buf_width - frm_width);
+        }
         pu1_src += src_strd;
         pu1_dst += dst_strd;
+    }
+    while(rows < buf_height)
+    {
+        memset(pu1_dst, 0x0, buf_width);
+        pu1_dst += dst_strd;
+        rows++;
     }
 
     if(IV_YUV_420P == chroma_format)
@@ -1672,8 +1729,10 @@ IV_API_CALL_STATUS_T ihevce_copy_inp_8bit(
         pu1_dst = (UWORD8 *)ps_curr_inp->s_input_buf.pv_u_buf;
         dst_strd = ps_curr_inp->s_input_buf.i4_uv_strd;
 
-        frm_width = ps_curr_inp->s_input_buf.i4_uv_wd >> 1;
-        frm_height = ps_curr_inp->s_input_buf.i4_uv_ht;
+        frm_width = i4_orig_wd >> 1;
+        frm_height = i4_orig_ht >> 1;
+        buf_width = ps_curr_inp->s_input_buf.i4_uv_wd;
+        buf_height = ps_curr_inp->s_input_buf.i4_uv_ht;
 
         if((ps_inp->ai4_inp_size[1] < (ps_inp->ai4_inp_strd[1] * frm_height)) ||
            (ps_inp->ai4_inp_size[1] <= 0) || (pu1_src_u == NULL))
@@ -1695,10 +1754,21 @@ IV_API_CALL_STATUS_T ihevce_copy_inp_8bit(
                 pu1_dst[(cols << 1)] = pu1_src_u[cols];
                 pu1_dst[(cols << 1) + 1] = pu1_src_v[cols];
             }
+            if(buf_width > (cols << 1))
+            {
+                memset(&pu1_dst[(cols << 1)], 0x80, buf_width - (cols << 1));
+            }
 
             pu1_src_u += src_strd_u;
             pu1_src_v += src_strd_v;
             pu1_dst += dst_strd;
+        }
+        while(rows < buf_height)
+        {
+            memset(pu1_dst, 0x80, buf_width);
+
+            pu1_dst += dst_strd;
+            rows++;
         }
     }
     else if(IV_YUV_420SP_UV == chroma_format)
@@ -1708,8 +1778,10 @@ IV_API_CALL_STATUS_T ihevce_copy_inp_8bit(
         pu1_dst = (UWORD8 *)ps_curr_inp->s_input_buf.pv_u_buf;
         dst_strd = ps_curr_inp->s_input_buf.i4_uv_strd;
 
-        frm_width = ps_curr_inp->s_input_buf.i4_uv_wd;
-        frm_height = ps_curr_inp->s_input_buf.i4_uv_ht;
+        frm_width = i4_orig_wd;
+        frm_height = i4_orig_ht >> 1;
+        buf_width = ps_curr_inp->s_input_buf.i4_uv_wd;
+        buf_height = ps_curr_inp->s_input_buf.i4_uv_ht;
 
         if((ps_inp->ai4_inp_size[1] < (ps_inp->ai4_inp_strd[1] * frm_height)) ||
            (ps_inp->ai4_inp_size[1] <= 0) || (pu1_src == NULL))
@@ -1721,8 +1793,18 @@ IV_API_CALL_STATUS_T ihevce_copy_inp_8bit(
         for(rows = 0; rows < frm_height; rows++)
         {
             memcpy(pu1_dst, pu1_src, frm_width);
+            if(buf_width > frm_width)
+            {
+                memset(pu1_dst + frm_width, 0x80, buf_width - frm_width);
+            }
             pu1_src += src_strd;
             pu1_dst += dst_strd;
+        }
+        while(rows < buf_height)
+        {
+            memset(pu1_dst, 0x80, buf_width);
+            pu1_dst += dst_strd;
+            rows++;
         }
     }
     return (IV_SUCCESS);
@@ -1916,9 +1998,65 @@ IHEVCE_PLUGIN_STATUS_T
                     result = ihevce_copy_inp_8bit(
                         ps_curr_inp,
                         ps_inp,
-                        ps_ctxt->ps_static_cfg_prms->s_src_prms.inp_chr_format);
+                        ps_ctxt->ps_static_cfg_prms->s_src_prms.inp_chr_format,
+                        ps_ctxt->ps_static_cfg_prms->s_src_prms.i4_orig_width,
+                        ps_ctxt->ps_static_cfg_prms->s_src_prms.i4_orig_height);
+
                     if(IV_SUCCESS != result)
                         return (IHEVCE_EFAIL);
+
+                    if(3 != ps_ctxt->ps_static_cfg_prms->s_config_prms.i4_rate_control_mode)
+                    {
+                        /* Dynamic Change in bitrate not supported for multi res/MBR */
+                        /*** Check for change in bitrate command ***/
+                        if(ps_ctxt->ai4_old_bitrate[0][0] != ps_inp->i4_curr_bitrate)
+                        {
+                            WORD32 buf_id;
+                            WORD32 *pi4_cmd_buf;
+                            iv_input_ctrl_buffs_t *ps_ctrl_buf;
+                            ihevce_dyn_config_prms_t *ps_dyn_br;
+                            WORD32 codec_level_index = ihevce_get_level_index(
+                                ps_ctxt->ps_static_cfg_prms->s_tgt_lyr_prms.as_tgt_params[0]
+                                    .i4_codec_level);
+                            WORD32 max_bitrate =
+                                g_as_level_data[codec_level_index].i4_max_bit_rate
+                                    [ps_ctxt->ps_static_cfg_prms->s_out_strm_prms.i4_codec_tier] *
+                                1000;
+
+                            /* ---------- get a free buffer from command Q ------ */
+                            ps_ctrl_buf = (iv_input_ctrl_buffs_t *)ihevce_q_get_free_inp_ctrl_buff(
+                                ps_interface_ctxt, &buf_id, BUFF_QUE_BLOCKING_MODE);
+                            /* store the buffer id */
+                            ps_ctrl_buf->i4_buf_id = buf_id;
+
+                            /* get the buffer pointer */
+                            pi4_cmd_buf = (WORD32 *)ps_ctrl_buf->pv_asynch_ctrl_bufs;
+
+                            /* store the set default command, encoder should use create time prms */
+                            *pi4_cmd_buf = IHEVCE_ASYNCH_API_SETBITRATE_TAG;
+                            *(pi4_cmd_buf + 1) = sizeof(ihevce_dyn_config_prms_t);
+
+                            ps_dyn_br = (ihevce_dyn_config_prms_t *)(pi4_cmd_buf + 2);
+                            ps_dyn_br->i4_size = sizeof(ihevce_dyn_config_prms_t);
+                            ps_dyn_br->i4_tgt_br_id = 0;
+                            ps_dyn_br->i4_tgt_res_id = 0;
+                            ps_dyn_br->i4_new_tgt_bitrate =
+                                MIN(ps_inp->i4_curr_bitrate, max_bitrate);
+                            ps_dyn_br->i4_new_peak_bitrate =
+                                MIN((ps_dyn_br->i4_new_tgt_bitrate << 1), max_bitrate);
+
+                            pi4_cmd_buf += 2;
+                            pi4_cmd_buf += (sizeof(ihevce_dyn_config_prms_t) >> 2);
+
+                            *(pi4_cmd_buf) = IHEVCE_ASYNCH_API_END_TAG;
+
+                            /* ---------- set the buffer as produced ---------- */
+                            ihevce_q_set_inp_ctrl_buff_prod(ps_interface_ctxt, buf_id);
+
+                            ps_ctxt->ai4_old_bitrate[0][0] = ps_inp->i4_curr_bitrate;
+                        }
+                    }
+
                     ps_ctxt->u8_num_frames_queued++;
                 }
                 else
